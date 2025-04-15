@@ -1,0 +1,70 @@
+# Terraform files
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.backup
+terraform.tfstate.*.backup
+*.tfvars
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+crash.log
+crash.*.log
+
+# AWS credentials and config
+.aws/
+aws.json
+credentials
+config
+
+# Kubernetes
+kubeconfig
+*.kubeconfig
+kube.config
+.kube/
+
+# Environment variables
+.env
+.envrc
+.env.local
+.env.*.local
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+tmp/
+
+# Generated files
+generated/
+dist/
+
+# Dependency directories
+node_modules/
+vendor/
+
+# Local development files
+local/
