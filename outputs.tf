@@ -30,7 +30,7 @@ output "karpenter_instance_profile_name" {
 
 output "karpenter_iam_role_arn" {
   description = "The ARN of the Karpenter IAM role"
-  value       = module.karpenter.iam_role_arn
+  value       = aws_iam_role.karpenter_controller.arn
 }
 
 output "configure_kubectl" {

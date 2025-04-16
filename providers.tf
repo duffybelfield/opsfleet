@@ -1,10 +1,13 @@
+# Configure AWS providers
 provider "aws" {
   region = var.region
+  # Profile is set via AWS_PROFILE environment variable in terraform-wrapper.sh
 }
 
 provider "aws" {
   region = "us-east-1"
   alias  = "virginia"
+  # Profile is set via AWS_PROFILE environment variable in terraform-wrapper.sh
 }
 
 provider "helm" {

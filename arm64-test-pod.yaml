@@ -2,18 +2,27 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: arm64-test
+  namespace: kube-system
   labels:
     app: arm64-test
+  annotations:
+    karpenter.sh/do-not-evict: "true"
 spec:
   nodeSelector:
     kubernetes.io/arch: arm64
+  tolerations:
+  - key: "karpenter.sh/capacity-type"
+    operator: "Exists"
   containers:
   - name: nginx
     image: nginx:latest
     resources:
       requests:
-        cpu: 100m
-        memory: 128Mi
+        cpu: 1
+        memory: 1Gi
       limits:
-        cpu: 500m
-        memory: 512Mi
+        cpu: 2
+        memory: 2Gi
+    # Add a command that keeps the container running
+    command: ["/bin/sh", "-c"]
+    args: ["echo 'ARM64 test pod running'; sleep infinity"]

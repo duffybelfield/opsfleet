@@ -136,6 +136,13 @@ resource "aws_iam_policy" "karpenter_ec2_permissions" {
           "ec2:DescribeSubnets",
           "ec2:DescribeLaunchTemplates",
           "ec2:DescribeLaunchTemplateVersions",
+          "ec2:RunInstances",
+          "ec2:CreateFleet",
+          "ec2:CreateTags",
+          "ec2:TerminateInstances",
+          "pricing:GetProducts",
+          "iam:PassRole",
+          "iam:GetInstanceProfile",
           "ecs:DescribeInstanceTypes"
         ]
         Resource = "*"
@@ -148,8 +155,9 @@ resource "aws_iam_policy" "karpenter_ec2_permissions" {
 
 # Update the aws_iam_role_policy_attachment.karpenter_ec2_read_only resource
 resource "aws_iam_role_policy_attachment" "karpenter_ec2_read_only" {
-  # Extract the role name from the ARN using split and element functions
-  role       = element(split("/", module.karpenter.iam_role_arn), 1)
+  # This policy is no longer needed as we're using our custom role
+  count      = 0
+  role       = "unused"
   policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess"
   
   depends_on = [
@@ -159,54 +167,49 @@ resource "aws_iam_role_policy_attachment" "karpenter_ec2_read_only" {
 
 # Attach the custom policy to the Karpenter role
 resource "aws_iam_role_policy_attachment" "karpenter_ec2_permissions" {
-  role       = element(split("/", module.karpenter.iam_role_arn), 1)
+  # This policy is no longer needed as we're using our custom role
+  count      = 0
+  role       = "unused"
   policy_arn = aws_iam_policy.karpenter_ec2_permissions.arn
-  
-  depends_on = [
-    module.karpenter
-  ]
 }
 
-# Add resources to automatically apply Kubernetes manifests after cluster is ready
-# Add a resource to fix the IAM role trust relationship
-resource "null_resource" "karpenter_trust_relationship_fix" {
-  depends_on = [
-    module.karpenter
-  ]
+# Create a dedicated IAM role for Karpenter with the correct namespace in the trust relationship
+resource "aws_iam_role" "karpenter_controller" {
+  name = "KarpenterController-${local.name}"
   
-  provisioner "local-exec" {
-    command = <<-EOT
-      # Extract the role name from the ARN
-      ROLE_NAME=$(echo ${module.karpenter.iam_role_arn} | cut -d'/' -f2)
-      
-      # Get the OIDC provider and format it correctly
-      OIDC_PROVIDER="${module.eks.oidc_provider}"
-      OIDC_PROVIDER_ARN="${module.eks.oidc_provider_arn}"
-      
-      # Create the policy document
-      POLICY_DOC='{
-        "Version": "2012-10-17",
-        "Statement": [
-          {
-            "Effect": "Allow",
-            "Principal": {
-              "Federated": "'$OIDC_PROVIDER_ARN'"
-            },
-            "Action": "sts:AssumeRoleWithWebIdentity",
-            "Condition": {
-              "StringEquals": {
-                "'$OIDC_PROVIDER':sub": "system:serviceaccount:kube-system:karpenter",
-                "'$OIDC_PROVIDER':aud": "sts.amazonaws.com"
-              }
-            }
+  # Use the namespace from the Helm chart (kube-system)
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Federated = module.eks.oidc_provider_arn
+        }
+        Action = "sts:AssumeRoleWithWebIdentity"
+        Condition = {
+          StringEquals = {
+            "${module.eks.oidc_provider}:sub" = "system:serviceaccount:kube-system:karpenter"
+            "${module.eks.oidc_provider}:aud" = "sts.amazonaws.com"
           }
-        ]
-      }'
-      
-      # Update the trust relationship
-      aws iam update-assume-role-policy --role-name $ROLE_NAME --policy-document "$POLICY_DOC"
-    EOT
-  }
+        }
+      }
+    ]
+  })
+  
+  tags = local.tags
+}
+
+# Attach the EC2 permissions policy to the new role
+resource "aws_iam_role_policy_attachment" "karpenter_controller_ec2_permissions" {
+  role       = aws_iam_role.karpenter_controller.name
+  policy_arn = aws_iam_policy.karpenter_ec2_permissions.arn
+}
+
+# Attach the EC2 read-only policy to the new role
+resource "aws_iam_role_policy_attachment" "karpenter_controller_ec2_read_only" {
+  role       = aws_iam_role.karpenter_controller.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess"
 }
 
 resource "null_resource" "apply_kubernetes_manifests" {
@@ -215,48 +218,352 @@ resource "null_resource" "apply_kubernetes_manifests" {
     module.karpenter,
     null_resource.wait_for_cluster,
     null_resource.karpenter_serviceaccount_patch,
-    null_resource.karpenter_trust_relationship_fix,
+    aws_iam_role.karpenter_controller,
+    aws_iam_role_policy_attachment.karpenter_controller_ec2_permissions,
+    aws_iam_role_policy_attachment.karpenter_controller_ec2_read_only,
     kubectl_manifest.karpenter_node_class,
-    kubectl_manifest.karpenter_node_pool,
-    aws_iam_role_policy_attachment.karpenter_ec2_read_only
+    kubectl_manifest.karpenter_node_pool
   ]
   
   provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
       # Configure kubectl
-      aws eks update-kubeconfig --region ${var.region} --name ${module.eks.cluster_name}
+      AWS_PROFILE=${var.aws_profile} aws eks update-kubeconfig --region ${var.region} --name ${module.eks.cluster_name}
       
       # Wait for Karpenter to be ready
       echo "Waiting for Karpenter to be ready..."
       kubectl wait --for=condition=available --timeout=300s deployment/karpenter -n kube-system || true
       
-      # First apply the ConfigMap (required for nginx)
-      echo "Applying ConfigMap..."
-      kubectl apply -f nginx-config.yaml
+      # Apply all Kubernetes manifest files
+      echo "Applying Kubernetes manifest files..."
+      %{for manifest_file in var.k8s_manifest_files~}
+      echo "Applying ${manifest_file}..."
+      kubectl apply -f ${manifest_file}
+      %{endfor~}
       
-      # Apply the ARM64 test pod to ensure ARM64 node provisioning
-      echo "Applying ARM64 test pod to provision ARM64 node..."
-      kubectl apply -f arm64-test-pod.yaml
+      # Comprehensive debugging for ARM64 provisioning issues
+      echo "============= STARTING COMPREHENSIVE DEBUGGING ============="
       
-      # Wait for ARM64 node to be provisioned
+      # 0. Check and fix NodePool status
+      echo "0. Checking and fixing NodePool status..."
+      kubectl get nodepool
+      kubectl describe nodepool default
+      
+      # Try to fix the NodePool by recreating it
+      echo "Recreating the NodePool..."
+      kubectl delete nodepool default || true
+      sleep 10
+      kubectl apply -f - <<EOF
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: default
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: default
+      requirements:
+        - key: "kubernetes.io/arch"
+          operator: In
+          values: ["arm64", "amd64"]
+        - key: "karpenter.k8s.aws/instance-category"
+          operator: In
+          values: ["t", "c", "m", "r"]
+        - key: "karpenter.k8s.aws/instance-cpu"
+          operator: In
+          values: ["2", "4", "8"]
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 30s
+  limits:
+    cpu: 1000
+EOF
+      
+      # 1. Check Karpenter deployment status
+      echo "1. Checking Karpenter deployment status..."
+      kubectl get deployment -n kube-system karpenter -o wide
+      
+      # 2. Check Karpenter logs
+      echo "2. Checking Karpenter logs for provisioning requests..."
+      echo "Full Karpenter logs:"
+      kubectl logs -n kube-system -l app.kubernetes.io/name=karpenter --tail=200
+      
+      echo "Filtered logs for provisioning:"
+      kubectl logs -n kube-system -l app.kubernetes.io/name=karpenter --tail=100 | grep -i provision || true
+      
+      echo "Filtered logs for ARM64:"
+      kubectl logs -n kube-system -l app.kubernetes.io/name=karpenter --tail=100 | grep -i arm64 || true
+      
+      echo "Filtered logs for errors:"
+      kubectl logs -n kube-system -l app.kubernetes.io/name=karpenter --tail=100 | grep -i error || true
+      
+      echo "Filtered logs for warnings:"
+      kubectl logs -n kube-system -l app.kubernetes.io/name=karpenter --tail=100 | grep -i warn || true
+      
+      # 3. Check NodePool and EC2NodeClass configuration
+      echo "3. Checking NodePool and EC2NodeClass configuration..."
+      kubectl get nodepool -o yaml
+      kubectl get ec2nodeclass -o yaml
+      kubectl describe ec2nodeclass default
+      
+      # Check EC2NodeClass status in detail
+      echo "Checking EC2NodeClass status in detail..."
+      kubectl get ec2nodeclass default -o yaml
+      kubectl describe ec2nodeclass default
+      
+      # Check if the IAM role exists and matches the one in EC2NodeClass
+      echo "Checking if the IAM role exists and matches the one in EC2NodeClass..."
+      EC2_ROLE=$(kubectl get ec2nodeclass default -o jsonpath='{.spec.role}')
+      echo "Role name in EC2NodeClass: $EC2_ROLE"
+      echo "Expected role name: ${local.name}"
+      
+      if [ "$EC2_ROLE" != "${local.name}" ]; then
+        echo "WARNING: Role name mismatch between EC2NodeClass ($EC2_ROLE) and expected role (${local.name})"
+      fi
+      
+      AWS_PROFILE=${var.aws_profile} aws iam get-role --role-name ${local.name} || echo "Role ${local.name} does not exist"
+      
+      if [ "$EC2_ROLE" != "${local.name}" ]; then
+        AWS_PROFILE=${var.aws_profile} aws iam get-role --role-name $EC2_ROLE || echo "Role $EC2_ROLE does not exist"
+      fi
+      
+      # Check if the instance profile exists for the role
+      echo "Checking if the instance profile exists for the role..."
+      AWS_PROFILE=${var.aws_profile} aws iam list-instance-profiles-for-role --role-name ${local.name} || echo "No instance profile found for role ${local.name}"
+      
+      if [ "$EC2_ROLE" != "${local.name}" ]; then
+        AWS_PROFILE=${var.aws_profile} aws iam list-instance-profiles-for-role --role-name $EC2_ROLE || echo "No instance profile found for role $EC2_ROLE"
+      fi
+      
+      # Check the instance profile name from Karpenter module
+      echo "Instance profile name from Karpenter module: ${module.karpenter.instance_profile_name}"
+      
+      # Check if the EC2NodeClass is using the correct instance profile name
+      echo "Checking if the EC2NodeClass is using the correct instance profile name..."
+      EC2_INSTANCE_PROFILE=$(kubectl get ec2nodeclass default -o jsonpath='{.spec.instanceProfile}' 2>/dev/null || echo "Not set")
+      echo "Instance profile in EC2NodeClass: $EC2_INSTANCE_PROFILE"
+      
+      if [ "$EC2_INSTANCE_PROFILE" = "Not set" ]; then
+        echo "WARNING: instanceProfile is not set in EC2NodeClass. It should be set to ${module.karpenter.instance_profile_name}"
+        
+        # Try to update the EC2NodeClass to include the instance profile
+        echo "Updating EC2NodeClass to include the instance profile..."
+        kubectl patch ec2nodeclass default --type=merge -p "{\"spec\":{\"instanceProfile\":\"${module.karpenter.instance_profile_name}\"}}" || true
+      elif [ "$EC2_INSTANCE_PROFILE" != "${module.karpenter.instance_profile_name}" ]; then
+        echo "WARNING: Instance profile mismatch between EC2NodeClass ($EC2_INSTANCE_PROFILE) and Karpenter module (${module.karpenter.instance_profile_name})"
+        
+        # Try to update the EC2NodeClass to use the correct instance profile
+        echo "Updating EC2NodeClass to use the correct instance profile..."
+        kubectl patch ec2nodeclass default --type=merge -p "{\"spec\":{\"instanceProfile\":\"${module.karpenter.instance_profile_name}\"}}" || true
+      fi
+      
+      # Check if the subnets with the discovery tag exist
+      echo "Checking if subnets with the discovery tag exist..."
+      AWS_PROFILE=${var.aws_profile} aws ec2 describe-subnets --filters "Name=tag:karpenter.sh/discovery,Values=${module.eks.cluster_name}" || echo "No subnets found with the discovery tag"
+      
+      # Check if the security groups with the discovery tag exist
+      echo "Checking if security groups with the discovery tag exist..."
+      AWS_PROFILE=${var.aws_profile} aws ec2 describe-security-groups --filters "Name=tag:karpenter.sh/discovery,Values=${module.eks.cluster_name}" || echo "No security groups found with the discovery tag"
+      
+      # Try to fix the EC2NodeClass by recreating it with more detailed configuration
+      echo "Recreating the EC2NodeClass with more detailed configuration..."
+      kubectl delete ec2nodeclass default || true
+      sleep 10
+      
+      # Get the actual subnet IDs and security group IDs
+      SUBNET_IDS=$(AWS_PROFILE=${var.aws_profile} aws ec2 describe-subnets --filters "Name=tag:karpenter.sh/discovery,Values=${module.eks.cluster_name}" --query "Subnets[*].SubnetId" --output text | tr '\t' ',')
+      SG_IDS=$(AWS_PROFILE=${var.aws_profile} aws ec2 describe-security-groups --filters "Name=tag:karpenter.sh/discovery,Values=${module.eks.cluster_name}" --query "SecurityGroups[*].GroupId" --output text | tr '\t' ',')
+      
+      # Create the EC2NodeClass with explicit subnet and security group IDs if available
+      if [ -n "$SUBNET_IDS" ] && [ -n "$SG_IDS" ]; then
+        echo "Creating EC2NodeClass with explicit subnet IDs: $SUBNET_IDS and security group IDs: $SG_IDS"
+        kubectl apply -f - <<EOF
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: default
+spec:
+  amiSelectorTerms:
+    - alias: bottlerocket@latest
+  instanceProfile: ${module.karpenter.instance_profile_name}
+  subnetSelector:
+    aws-ids: $SUBNET_IDS
+  securityGroupSelector:
+    aws-ids: $SG_IDS
+  tags:
+    karpenter.sh/discovery: ${module.eks.cluster_name}
+EOF
+      else
+        echo "Creating EC2NodeClass with tag selectors"
+        kubectl apply -f - <<EOF
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: default
+spec:
+  amiSelectorTerms:
+    - alias: bottlerocket@latest
+  instanceProfile: ${module.karpenter.instance_profile_name}
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: ${module.eks.cluster_name}
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: ${module.eks.cluster_name}
+  tags:
+    karpenter.sh/discovery: ${module.eks.cluster_name}
+EOF
+      fi
+      
+      # 4. Check ARM64 test pod status
+      echo "4. Checking ARM64 test pod status..."
+      kubectl describe pod arm64-test -n kube-system
+      
+      # 5. Check if there are any events related to provisioning
+      echo "5. Checking cluster events related to provisioning..."
+      kubectl get events -n kube-system | grep -i provision || true
+      kubectl get events -n kube-system | grep -i arm64 || true
+      
+      # 6. Check if there are any pending pods
+      echo "6. Checking for pending pods..."
+      kubectl get pods -A | grep Pending || true
+      
+      # 7. Check available instance types in the region
+      echo "7. Checking available ARM64 instance types in the region..."
+      AWS_PROFILE=${var.aws_profile} aws ec2 describe-instance-types --filters "Name=processor-info.supported-architecture,Values=arm64" --query "InstanceTypes[*].InstanceType" --output text | tr '\t' '\n' | sort
+      
+      # 8. Check if there are any capacity issues in the region
+      echo "8. Checking for capacity issues in the region..."
+      kubectl logs -n kube-system -l app.kubernetes.io/name=karpenter --tail=100 | grep -i "capacity" || true
+      kubectl logs -n kube-system -l app.kubernetes.io/name=karpenter --tail=100 | grep -i "insufficient" || true
+      
+      # 8.5 Check IAM role and permissions
+      echo "8.5. Checking IAM role and permissions for Karpenter..."
+      echo "Karpenter service account:"
+      kubectl get serviceaccount -n kube-system karpenter -o yaml
+      
+      echo "Checking IAM role ARN annotation:"
+      kubectl get serviceaccount -n kube-system karpenter -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}'
+      echo ""
+      
+      echo "Checking if Karpenter can assume the role:"
+      ROLE_ARN=$(kubectl get serviceaccount -n kube-system karpenter -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}')
+      if [ -n "$ROLE_ARN" ]; then
+        AWS_PROFILE=${var.aws_profile} aws sts get-caller-identity
+        echo "Checking role policies:"
+        ROLE_NAME=$(echo $ROLE_ARN | cut -d'/' -f2)
+        AWS_PROFILE=${var.aws_profile} aws iam list-attached-role-policies --role-name $ROLE_NAME || true
+        
+        # Check the trust relationship
+        echo "Checking trust relationship for role $ROLE_NAME:"
+        AWS_PROFILE=${var.aws_profile} aws iam get-role --role-name $ROLE_NAME --query "Role.AssumeRolePolicyDocument" || true
+        
+        # Check the EC2 permissions in detail
+        echo "Checking EC2 permissions in detail:"
+        for policy in $(AWS_PROFILE=${var.aws_profile} aws iam list-attached-role-policies --role-name $ROLE_NAME --query "AttachedPolicies[*].PolicyArn" --output text); do
+          echo "Policy: $policy"
+          AWS_PROFILE=${var.aws_profile} aws iam get-policy-version --policy-arn $policy --version-id $(AWS_PROFILE=${var.aws_profile} aws iam get-policy --policy-arn $policy --query "Policy.DefaultVersionId" --output text) --query "PolicyVersion.Document" || true
+        done
+        
+        # Check if the node IAM role exists and has the necessary permissions
+        echo "Checking node IAM role ${local.name}:"
+        AWS_PROFILE=${var.aws_profile} aws iam get-role --role-name ${local.name} || echo "Node role does not exist"
+        AWS_PROFILE=${var.aws_profile} aws iam list-attached-role-policies --role-name ${local.name} || echo "Cannot list policies for node role"
+      else
+        echo "No role ARN found on the service account"
+      fi
+      
+      # 9. Check Karpenter Helm release configuration
+      echo "9. Checking Karpenter Helm release configuration..."
+      helm get values -n kube-system karpenter || true
+      helm get manifest -n kube-system karpenter | grep -A 20 "kind: Deployment" || true
+      
+      # 10. Try to force provisioning by scaling the deployment
+      echo "10. Trying to force ARM64 provisioning by creating more pods..."
+      cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: arm64-test-deployment
+  namespace: kube-system
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: arm64-test-deployment
+  template:
+    metadata:
+      labels:
+        app: arm64-test-deployment
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      containers:
+      - name: nginx
+        image: nginx:latest
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 1
+            memory: 1Gi
+EOF
+      
+      # Wait for ARM64 node to be provisioned with increased timeout
       echo "Waiting for ARM64 node to be provisioned..."
-      for i in {1..10}; do
+      for i in {1..20}; do
         if kubectl get nodes -l kubernetes.io/arch=arm64 | grep -q arm64; then
           echo "ARM64 node provisioned successfully!"
           break
         fi
-        echo "Waiting for ARM64 node... attempt $i/10"
+        
+        # Debug Karpenter provisioning every iteration
+        echo "Iteration $i: Checking Karpenter logs for ARM64 provisioning..."
+        kubectl logs -n kube-system -l app.kubernetes.io/name=karpenter --tail=50 | grep -i arm64 || true
+        kubectl logs -n kube-system -l app.kubernetes.io/name=karpenter --tail=50 | grep -i provision || true
+        
+        # Check pending pods
+        echo "Iteration $i: Checking pending pods..."
+        kubectl get pods -A | grep Pending || true
+        
+        echo "Waiting for ARM64 node... attempt $i/20"
         sleep 30
       done
       
       # Wait for the ARM64 node to be ready
       echo "Waiting for ARM64 node to be ready..."
-      kubectl wait --for=condition=ready --selector=kubernetes.io/arch=arm64 --timeout=300s node || true
+      kubectl wait --for=condition=ready --selector=kubernetes.io/arch=arm64 --timeout=600s node || true
       
-      # Now apply the nginx deployment and service
-      echo "Applying nginx deployment and service..."
-      kubectl apply -f nginx-deployment.yaml
-      kubectl apply -f nginx-service.yaml
+      # If ARM64 node is still not provisioned, try to check if ARM64 instances are available in the region
+      if ! kubectl get nodes -l kubernetes.io/arch=arm64 | grep -q arm64; then
+        echo "ARM64 node not provisioned. Checking if ARM64 instances are available in the region..."
+        
+        # Check available ARM64 instance types in the region
+        echo "Available ARM64 instance types in the region:"
+        AWS_PROFILE=${var.aws_profile} aws ec2 describe-instance-types --filters "Name=processor-info.supported-architecture,Values=arm64" --query "InstanceTypes[*].InstanceType" --output text | tr '\t' '\n' | sort
+        
+        # Check if there are any capacity issues in the region
+        echo "Checking for capacity issues in the region..."
+        AWS_PROFILE=${var.aws_profile} aws ec2 describe-spot-price-history --instance-types t4g.small --product-description "Linux/UNIX" --start-time $(date -u +"%Y-%m-%dT%H:%M:%SZ") --region ${var.region} --query "SpotPriceHistory[*].[AvailabilityZone, SpotPrice]" --output text || true
+        
+        # Try to launch a test ARM64 instance directly
+        echo "Trying to launch a test ARM64 instance directly..."
+        INSTANCE_ID=$(AWS_PROFILE=${var.aws_profile} aws ec2 run-instances --image-id ami-0eb11ab33f229b26c --count 1 --instance-type t4g.small --region ${var.region} --query "Instances[0].InstanceId" --output text || echo "Failed to launch instance")
+        
+        if [ "$INSTANCE_ID" != "Failed to launch instance" ]; then
+          echo "Successfully launched ARM64 test instance: $INSTANCE_ID"
+          echo "Terminating test instance..."
+          AWS_PROFILE=${var.aws_profile} aws ec2 terminate-instances --instance-ids $INSTANCE_ID --region ${var.region}
+          echo "This suggests the issue is with Karpenter configuration, not with ARM64 instance availability."
+        else
+          echo "Failed to launch ARM64 test instance. This suggests there might be capacity issues or account limits preventing ARM64 instance provisioning."
+        fi
+      fi
       
       # Monitor the deployment
       echo "Monitoring deployment..."

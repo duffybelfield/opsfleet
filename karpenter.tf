@@ -7,7 +7,7 @@ resource "null_resource" "wait_for_eks" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
       echo "Waiting for EKS cluster to be accessible..."
-      aws eks update-kubeconfig --region ${var.region} --name ${module.eks.cluster_name}
+      AWS_PROFILE=${var.aws_profile} aws eks update-kubeconfig --region ${var.region} --name ${module.eks.cluster_name}
       
       # Wait for the cluster to be accessible
       for i in {1..30}; do
@@ -31,7 +31,7 @@ resource "null_resource" "remove_existing_karpenter" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
       # First update kubeconfig
-      aws eks update-kubeconfig --region ${var.region} --name ${module.eks.cluster_name}
+      AWS_PROFILE=${var.aws_profile} aws eks update-kubeconfig --region ${var.region} --name ${module.eks.cluster_name}
       
       # Then try to uninstall Karpenter
       echo "Attempting to uninstall any existing Karpenter installation..."
@@ -40,7 +40,9 @@ resource "null_resource" "remove_existing_karpenter" {
   }
 }
 
+# Install Karpenter in the kube-system namespace to match the IAM role trust relationship
 resource "helm_release" "karpenter" {
+  # Important: This namespace must match the one in the IAM role trust relationship
   namespace           = "kube-system"
   create_namespace    = true
   name                = "karpenter"
@@ -72,7 +74,7 @@ resource "helm_release" "karpenter" {
         - name: AWS_DEFAULT_REGION
           value: ${local.region}
         - name: AWS_ROLE_ARN
-          value: ${module.karpenter.iam_role_arn}
+          value: ${aws_iam_role.karpenter_controller.arn}
         - name: AWS_WEB_IDENTITY_TOKEN_FILE
           value: /var/run/secrets/eks.amazonaws.com/serviceaccount/token
 
@@ -94,14 +96,16 @@ resource "helm_release" "karpenter" {
         region: ${local.region}
     
     # Configure service account with IAM role for IRSA
+    # This service account will be created in the kube-system namespace
     serviceAccount:
       create: true
       name: karpenter
+      # Set automountServiceAccountToken to true (will be enforced by kubectl_manifest as well)
       automountServiceAccountToken: true
       annotations:
-        eks.amazonaws.com/role-arn: ${module.karpenter.iam_role_arn}
+        eks.amazonaws.com/role-arn: ${aws_iam_role.karpenter_controller.arn}
     
-    # Force mounting of service account token
+    # Force mounting of service account token with explicit configuration
     extraVolumes:
       - name: aws-iam-token
         projected:
@@ -127,7 +131,10 @@ resource "helm_release" "karpenter" {
   depends_on = [
     module.eks,
     module.karpenter,
-    null_resource.wait_for_cluster
+    null_resource.wait_for_cluster,
+    aws_iam_role.karpenter_controller,
+    aws_iam_role_policy_attachment.karpenter_controller_ec2_permissions,
+    aws_iam_role_policy_attachment.karpenter_controller_ec2_read_only
   ]
 }
 
@@ -141,7 +148,7 @@ metadata:
 spec:
   amiSelectorTerms:
     - alias: bottlerocket@latest
-  role: ${module.karpenter.node_iam_role_name}
+  instanceProfile: ${module.karpenter.instance_profile_name}
   subnetSelectorTerms:
     - tags:
         karpenter.sh/discovery: ${module.eks.cluster_name}
@@ -166,6 +173,7 @@ kind: NodePool
 metadata:
   name: default
 spec:
+  # Simplify the NodePool configuration to ensure it's valid
   template:
     spec:
       nodeClassRef:
@@ -175,19 +183,16 @@ spec:
       requirements:
         - key: "kubernetes.io/arch"
           operator: In
-          values: ["amd64", "arm64"]
+          values: ["arm64", "amd64"]
         - key: "karpenter.k8s.aws/instance-category"
           operator: In
-          values: ["c", "m", "r"]
+          values: ["t", "c", "m", "r"]
         - key: "karpenter.k8s.aws/instance-cpu"
           operator: In
-          values: ["4", "8", "16", "32"]
-        - key: "karpenter.k8s.aws/instance-hypervisor"
-          operator: In
-          values: ["nitro"]
-        - key: "karpenter.k8s.aws/instance-generation"
-          operator: Gt
-          values: ["2"]
+          values: ["2", "4", "8"]
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 30s
   limits:
     cpu: 1000
   disruption:
@@ -210,7 +215,7 @@ resource "null_resource" "karpenter_serviceaccount_patch" {
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
-      aws eks update-kubeconfig --region ${var.region} --name ${module.eks.cluster_name}
+      AWS_PROFILE=${var.aws_profile} aws eks update-kubeconfig --region ${var.region} --name ${module.eks.cluster_name}
       echo "Patching Karpenter service account..."
       kubectl patch serviceaccount -n kube-system karpenter -p '{"automountServiceAccountToken": true}' || true
       echo "Service account patched successfully!"
@@ -223,7 +228,9 @@ resource "null_resource" "wait_for_cluster" {
   depends_on = [
     module.eks,
     module.karpenter,
-    null_resource.karpenter_trust_relationship_fix,
+    aws_iam_role.karpenter_controller,
+    aws_iam_role_policy_attachment.karpenter_controller_ec2_permissions,
+    aws_iam_role_policy_attachment.karpenter_controller_ec2_read_only,
     null_resource.remove_existing_karpenter
   ]
   
@@ -231,7 +238,7 @@ resource "null_resource" "wait_for_cluster" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
       echo "Waiting for EKS cluster to be fully available..."
-      aws eks update-kubeconfig --region ${var.region} --name ${module.eks.cluster_name}
+      AWS_PROFILE=${var.aws_profile} aws eks update-kubeconfig --region ${var.region} --name ${module.eks.cluster_name}
       
       # Wait for the cluster to be accessible
       for i in {1..30}; do
