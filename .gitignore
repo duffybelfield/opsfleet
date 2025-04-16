@@ -1,6 +1,7 @@
 # Terraform files
 .terraform/
 .terraform.lock.hcl
+.terraform.tfstate.lock.info
 terraform.tfstate
 terraform.tfstate.backup
 terraform.tfstate.*.backup
@@ -14,6 +15,11 @@ override.tf.json
 terraform.rc
 crash.log
 crash.*.log
+terraform.tfplan
+tfplan
+.terraform.d/
+plan.out
+plan.json
 
 # AWS credentials and config
 .aws/

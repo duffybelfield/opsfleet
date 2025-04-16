@@ -1,3 +1,45 @@
+resource "null_resource" "wait_for_eks" {
+  depends_on = [
+    module.eks
+  ]
+  
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      echo "Waiting for EKS cluster to be accessible..."
+      aws eks update-kubeconfig --region ${var.region} --name ${module.eks.cluster_name}
+      
+      # Wait for the cluster to be accessible
+      for i in {1..30}; do
+        if kubectl get ns kube-system &>/dev/null; then
+          echo "EKS cluster is now accessible!"
+          break
+        fi
+        echo "Waiting for EKS cluster to be accessible... attempt $i/30"
+        sleep 10
+      done
+    EOT
+  }
+}
+
+resource "null_resource" "remove_existing_karpenter" {
+  depends_on = [
+    null_resource.wait_for_eks
+  ]
+  
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      # First update kubeconfig
+      aws eks update-kubeconfig --region ${var.region} --name ${module.eks.cluster_name}
+      
+      # Then try to uninstall Karpenter
+      echo "Attempting to uninstall any existing Karpenter installation..."
+      helm uninstall karpenter -n kube-system --ignore-not-found || true
+    EOT
+  }
+}
+
 resource "helm_release" "karpenter" {
   namespace           = "kube-system"
   create_namespace    = true
@@ -6,20 +48,20 @@ resource "helm_release" "karpenter" {
   repository_username = data.aws_ecrpublic_authorization_token.token.user_name
   repository_password = data.aws_ecrpublic_authorization_token.token.password
   chart               = "karpenter"
-  version             = "1.3.3"
+  version             = var.karpenter_version
   wait                = true
   timeout             = 600
 
   values = [
     <<-EOT
-    # Explicitly set the controller image for 1.3.3
+    # Explicitly set the controller image
     controller:
       image:
         repository: public.ecr.aws/karpenter/controller
-        tag: 1.3.3
+        tag: ${var.karpenter_version}
       resources:
         requests:
-          cpu: 1
+          cpu: 100m
           memory: 1Gi
         limits:
           cpu: 1
@@ -84,7 +126,8 @@ resource "helm_release" "karpenter" {
 
   depends_on = [
     module.eks,
-    module.karpenter
+    module.karpenter,
+    null_resource.wait_for_cluster
   ]
 }
 
@@ -110,7 +153,8 @@ spec:
 YAML
 
   depends_on = [
-    helm_release.karpenter
+    helm_release.karpenter,
+    null_resource.karpenter_serviceaccount_patch
   ]
 }
 
@@ -154,4 +198,54 @@ YAML
   depends_on = [
     kubectl_manifest.karpenter_node_class
   ]
+}
+
+# Add a post-install hook to patch the service account
+resource "null_resource" "karpenter_serviceaccount_patch" {
+  depends_on = [
+    helm_release.karpenter,
+    null_resource.wait_for_cluster
+  ]
+  
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      aws eks update-kubeconfig --region ${var.region} --name ${module.eks.cluster_name}
+      echo "Patching Karpenter service account..."
+      kubectl patch serviceaccount -n kube-system karpenter -p '{"automountServiceAccountToken": true}' || true
+      echo "Service account patched successfully!"
+    EOT
+  }
+}
+
+# Add a resource to wait for the EKS cluster to be fully available
+resource "null_resource" "wait_for_cluster" {
+  depends_on = [
+    module.eks,
+    module.karpenter,
+    null_resource.karpenter_trust_relationship_fix,
+    null_resource.remove_existing_karpenter
+  ]
+  
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      echo "Waiting for EKS cluster to be fully available..."
+      aws eks update-kubeconfig --region ${var.region} --name ${module.eks.cluster_name}
+      
+      # Wait for the cluster to be accessible
+      for i in {1..30}; do
+        if kubectl get ns kube-system &>/dev/null; then
+          echo "EKS cluster is now accessible!"
+          break
+        fi
+        echo "Waiting for EKS cluster to be accessible... attempt $i/30"
+        sleep 10
+      done
+      
+      # Verify that the cluster is truly ready
+      kubectl wait --for=condition=available --timeout=300s deployment/coredns -n kube-system || true
+      echo "EKS cluster is fully operational!"
+    EOT
+  }
 }
