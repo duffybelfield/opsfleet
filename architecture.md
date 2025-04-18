@@ -158,29 +158,69 @@ Single-region, highly available VPC with multiple AZs.
 
 ```mermaid
 graph TB
-API_Gateway[API Gateway] -->|HTTPS| ALB[ALB]
-ALB -->|HTTPS| React_Frontend["React SPA (CloudFront)"]
-EKS[Managed EKS Cluster] --> Backend_Services[Backend Services]
-Backend_Services -->|DB Connection| PostgreSQL[RDS PostgreSQL]
-Backend_Services -->|Private API| ECR[Amazon ECR]
-CloudTrail[CloudTrail Logs] --> S3[CloudWatch & S3 Logs]
-CloudWatch --> CloudWatch_Logs[CloudWatch Logs]
-WAF[WAF] --> API_Gateway
-React_Frontend -->|API Calls| API_Gateway
-Backend_Services --> ECR
-API_Gateway -.->|CloudWatch| CloudWatch_Logs
-EKS -.->|Logs| CloudWatch_Logs
-subgraph Public_Subnet
-  API_Gateway
-  ALB
-  React_Frontend
-end
-subgraph Private_Subnet
-  EKS
-  Backend_Services
-  PostgreSQL
-  ECR
-end
-style Public_Subnet fill:#f0f0f0
-style Private_Subnet fill:#e0e0e0
+    %% External Users with Correct Traffic Flow
+    Users((Internet Users)) -->|Static Assets<br/>HTTPS| CloudFront[CloudFront CDN]
+    Users -->|API Requests<br/>HTTPS| WAF[AWS WAF]
+    
+    %% Frontend Layer
+    CloudFront -->|Origin| S3[S3 Bucket<br/>React SPA]
+    
+    %% API Layer with WAF Protection - Corrected Flow
+    WAF -->|Protected Traffic| API_Gateway[API Gateway]
+    API_Gateway -->|HTTPS| ALB[Application Load Balancer]
+    
+    %% Compute Layer
+    ALB -->|HTTPS| EKS[Amazon EKS Cluster]
+    
+    subgraph EKS_Cluster[EKS Cluster - Private Subnets]
+        Backend_Services[Backend Services<br/>Python/Flask APIs]
+        Karpenter[Karpenter<br/>Auto Scaling]
+        Monitoring[Prometheus/Grafana<br/>Monitoring]
+    end
+    
+    %% Database Layer
+    Backend_Services -->|SSL| RDS[(Amazon RDS<br/>PostgreSQL<br/>Multi-AZ)]
+    
+    %% CI/CD Pipeline
+    GitHub[GitHub Repo] -->|Webhooks| CodePipeline[AWS CodePipeline]
+    CodePipeline -->|Build| CodeBuild[AWS CodeBuild]
+    CodeBuild -->|Push Images| ECR[Amazon ECR]
+    CodeBuild -->|Deploy| EKS
+    
+    %% Security & Monitoring
+    CloudTrail[CloudTrail] -->|Logs| CloudWatch[CloudWatch]
+    VPC_Flow[VPC Flow Logs] -->|Logs| CloudWatch
+    EKS -->|Logs| CloudWatch
+    RDS -->|Logs| CloudWatch
+    CloudWatch -->|Alerts| SNS[SNS Notifications]
+    
+    %% Secrets Management
+    Backend_Services -->|Fetch Secrets| SecretsManager[AWS Secrets Manager]
+    
+    %% Network Boundaries
+    subgraph Public_Subnets[Public Subnets]
+        ALB
+        NAT[NAT Gateway]
+    end
+    
+    subgraph Private_Subnets[Private Subnets]
+        EKS_Cluster
+        RDS
+    end
+    
+    %% Egress Traffic
+    EKS_Cluster -->|Outbound| NAT
+    NAT -->|Outbound| Internet((Internet))
+    
+    %% Style
+    classDef aws fill:#FF9900,stroke:#232F3E,color:white;
+    classDef network fill:#7AA5D2,stroke:#2C5282,color:white;
+    classDef database fill:#3B48CC,stroke:#232F3E,color:white;
+    classDef security fill:#D13212,stroke:#232F3E,color:white;
+    
+    class CloudFront,S3,API_Gateway,ALB,EKS,RDS,CodePipeline,CodeBuild,ECR,CloudTrail,CloudWatch,SNS,SecretsManager aws;
+    class Public_Subnets,Private_Subnets,NAT network;
+    class RDS database;
+    class WAF,VPC_Flow security;
+
 
