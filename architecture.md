@@ -158,28 +158,29 @@ Single-region, highly available VPC with multiple AZs.
 
 ```mermaid
 graph TB
-    subgraph Public_Subnet
-        direction TB
-        API_Gateway[API Gateway] -->|HTTPS| ALB[ALB]
-        ALB -->|HTTPS| React_Frontend[React SPA (CloudFront)]
-    end
+API_Gateway[API Gateway] -->|HTTPS| ALB[ALB]
+ALB -->|HTTPS| React_Frontend["React SPA (CloudFront)"]
+EKS[Managed EKS Cluster] --> Backend_Services[Backend Services]
+Backend_Services -->|DB Connection| PostgreSQL[RDS PostgreSQL]
+Backend_Services -->|Private API| ECR[Amazon ECR]
+CloudTrail[CloudTrail Logs] --> S3[CloudWatch & S3 Logs]
+CloudWatch --> CloudWatch_Logs[CloudWatch Logs]
+WAF[WAF] --> API_Gateway
+React_Frontend -->|API Calls| API_Gateway
+Backend_Services --> ECR
+API_Gateway -.->|CloudWatch| CloudWatch_Logs
+EKS -.->|Logs| CloudWatch_Logs
+subgraph Public_Subnet
+  API_Gateway
+  ALB
+  React_Frontend
+end
+subgraph Private_Subnet
+  EKS
+  Backend_Services
+  PostgreSQL
+  ECR
+end
+style Public_Subnet fill:#f0f0f0
+style Private_Subnet fill:#e0e0e0
 
-    subgraph Private_Subnet
-        direction TB
-        EKS[Managed EKS Cluster] --> Backend_Services[Backend Services]
-        Backend_Services -->|DB Connection| PostgreSQL[RDS PostgreSQL]
-        Backend_Services -->|Private API| ECR[Amazon ECR]
-    end
-
-    CloudTrail[CloudTrail Logs] --> S3[CloudWatch & S3 Logs]
-    CloudWatch --> CloudWatch_Logs[CloudWatch Logs]
-    WAF[WAF] --> API_Gateway
-
-    React_Frontend -->|API Calls| API_Gateway
-    Backend_Services --> ECR
-
-    API_Gateway -.->|CloudWatch| CloudWatch_Logs
-    EKS -.->|Logs| CloudWatch_Logs
-
-    style Public_Subnet fill:#f0f0f0
-    style Private_Subnet fill:#e0e0e0
