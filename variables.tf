@@ -13,7 +13,7 @@ variable "aws_profile" {
 variable "cluster_name" {
   description = "Name of the EKS cluster"
   type        = string
-  default     = "startup-eks-cluster" # Will use the auto-generated name if not specified
+  default     = "opsfleet-example" # Will use the auto-generated name if not specified
 }
 
 variable "cluster_version" {
