@@ -22,18 +22,3 @@ output "vpc_id" {
   description = "The ID of the VPC"
   value       = module.vpc.vpc_id
 }
-
-output "karpenter_instance_profile_name" {
-  description = "The name of the Karpenter instance profile"
-  value       = module.karpenter.instance_profile_name
-}
-
-output "karpenter_iam_role_arn" {
-  description = "The ARN of the Karpenter IAM role"
-  value       = aws_iam_role.karpenter_controller.arn
-}
-
-output "configure_kubectl" {
-  description = "Command to configure kubectl"
-  value       = "aws eks update-kubeconfig --region ${var.region} --name ${module.eks.cluster_name}"
-}
