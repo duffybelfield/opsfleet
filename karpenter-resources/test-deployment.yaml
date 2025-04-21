@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inflate-amd64
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: inflate-amd64
+  template:
+    metadata:
+      labels:
+        app: inflate-amd64
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: amd64
+        karpenter.sh/capacity-type: spot
+      containers:
+      - name: inflate
+        image: public.ecr.aws/eks-distro/kubernetes/pause:3.7
+        resources:
+          requests:
+            cpu: 1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inflate-arm64
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: inflate-arm64
+  template:
+    metadata:
+      labels:
+        app: inflate-arm64
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: arm64
+        karpenter.sh/capacity-type: spot
+      containers:
+      - name: inflate
+        image: public.ecr.aws/eks-distro/kubernetes/pause:3.7
+        resources:
+          requests:
+            cpu: 1

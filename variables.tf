@@ -46,11 +46,7 @@ variable "node_group_desired_size" {
   default     = 2
 }
 
-variable "karpenter_version" {
-  description = "Version of Karpenter to install"
-  type        = string
-  default     = "1.3.3"
-}
+# Karpenter version is no longer needed as it will be installed manually
 
 variable "vpc_cidr" {
   description = "CIDR block for the VPC"

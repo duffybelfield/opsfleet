@@ -22,3 +22,7 @@ output "vpc_id" {
   description = "The ID of the VPC"
   value       = module.vpc.vpc_id
 }
+output "node_group_name" {
+  description = "Name of the EKS node group"
+  value       = module.eks.eks_managed_node_groups["karpenter"].node_group_id
+}
